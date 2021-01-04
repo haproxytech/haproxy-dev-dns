@@ -156,6 +156,7 @@ struct resolvers {
                                              * be a unique relation between an eb_root and an eb_node (resolution) */
 	struct list list;                   /* resolvers list */
 	struct list  nameservers;           /* dns server list */
+	struct proxy *px;                   /* px to handle connections to DNS servers */
 	char      *id;                      /* resolvers unique identifier */
 	struct {
 		const char *file;           /* file where the section appears */

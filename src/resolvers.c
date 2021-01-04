@@ -2772,6 +2772,21 @@ int check_action_do_resolve(struct act_rule *rule, struct proxy *px, char **err)
 
 	return 1;
 }
+
+void resolvers_setup_proxy(struct proxy *px)
+{
+	px->last_change = now.tv_sec;
+	px->cap = PR_CAP_FE | PR_CAP_BE;
+	px->maxconn = 0;
+	px->conn_retries = 1;
+	px->timeout.server = TICK_ETERNITY;
+	px->timeout.client = TICK_ETERNITY;
+	px->timeout.connect = TICK_ETERNITY;
+	px->accept = NULL;
+	px->options2 |= PR_O2_INDEPSTR | PR_O2_SMARTCON;
+	px->bind_proc = 0; /* will be filled by users */
+}
+
 /*
  * Parse a <resolvers> section.
  * Returns the error code, 0 if OK, or any combination of :
@@ -2787,6 +2802,7 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 	const char *err;
 	int err_code = 0;
 	char *errmsg = NULL;
+	struct proxy *p;
 
 	if (strcmp(args[0], "resolvers") == 0) { /* new resolvers section */
 		if (!*args[1]) {
@@ -2818,6 +2834,22 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
+                /* allocate new proxy to tcp servers */
+                p = calloc(1, sizeof *p);
+                if (!p) {
+                        ha_alert("parsing [%s:%d] : out of memory.\n", file, linenum);
+                        err_code |= ERR_ALERT | ERR_FATAL;
+                        goto out;
+                }
+
+                init_new_proxy(p);
+                resolvers_setup_proxy(p);
+                p->parent = curr_resolvers;
+                p->id = strdup(args[1]);
+                p->conf.args.file = p->conf.file = strdup(file);
+                p->conf.args.line = p->conf.line = linenum;
+                curr_resolvers->px = p;
+
 		/* default values */
 		LIST_ADDQ(&sec_resolvers, &curr_resolvers->list);
 		curr_resolvers->conf.file = strdup(file);
@@ -2843,6 +2875,9 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 		LIST_INIT(&curr_resolvers->resolutions.wait);
 		HA_SPIN_INIT(&curr_resolvers->lock);
 	}
+	else if (strcmp(args[0],"server") == 0) {
+		err_code |= parse_server(file, linenum, args, curr_resolvers->px, NULL, 1, 0, 1);
+        }
 	else if (strcmp(args[0], "nameserver") == 0) { /* nameserver definition */
 		struct dns_nameserver *newnameserver = NULL;
 		struct sockaddr_storage *sk;
