@@ -262,7 +262,7 @@ static void resolv_update_resolvers_timeout(struct resolvers *resolvers)
 /* Opens an UDP socket on the namesaver's IP/Port, if required. Returns 0 on
  * success, -1 otherwise.
  */
-static int dns_connect_namesaver(struct dns_nameserver *ns)
+static int dns_connect_nameserver(struct dns_nameserver *ns)
 {
 	struct dgram_conn *dgram = ns->dgram;
 	int fd;
@@ -352,6 +352,38 @@ static int resolv_build_query(int query_id, int query_type, unsigned int accepte
 	return (p - buf);
 }
 
+/* Sends a message to a name server
+ * It returns message length on success
+ * or -1 in error case
+ * 0 is returned in case of EAGAIN 
+ */
+int dns_send_nameserver(struct dns_nameserver *ns, void *buf, size_t len)
+{
+	int ret;
+
+	if (ns->dgram) {
+		int fd = ns->dgram->t.sock.fd;
+
+		if (fd == -1) {
+			if (dns_connect_nameserver(ns) == -1)
+				return -1;
+			fd = ns->dgram->t.sock.fd;
+		}
+
+		ret = send(fd, buf, len, 0);
+		if (ret < 0) {
+			if (errno == EAGAIN)
+				return 0;
+			
+			fd_delete(fd);
+			close(fd);
+			ns->dgram->t.sock.fd = -1;
+		}
+	}
+
+	return ret;
+}
+
 /* Sends a DNS query to resolvers associated to a resolution. It returns 0 on
  * success, -1 otherwise.
  */
@@ -372,34 +404,13 @@ static int resolv_send_query(struct resolv_resolution *resolution)
 	                      trash.area, trash.size);
 
 	list_for_each_entry(ns, &resolvers->nameservers, list) {
-		int fd = ns->dgram->t.sock.fd;
-		int ret;
-
-		if (fd == -1) {
-			if (dns_connect_namesaver(ns) == -1)
-				continue;
-			fd = ns->dgram->t.sock.fd;
-			resolvers->nb_nameservers++;
-		}
-
-		if (len < 0)
-			goto snd_error;
-
-		ret = send(fd, trash.area, len, 0);
-		if (ret == len) {
-			ns->counters->sent++;
-			resolution->nb_queries++;
+		if (len < 0) {
+			ns->counters->snd_error++;
 			continue;
 		}
 
-		if (ret == -1 && errno == EAGAIN) {
-			/* retry once the socket is ready */
-			fd_cant_send(fd);
-			continue;
-		}
-
-	snd_error:
-		ns->counters->snd_error++;
+		if (dns_send_nameserver(ns, trash.area, len) <= 0)
+			ns->counters->snd_error++;
 		resolution->nb_queries++;
 	}
 
@@ -2118,12 +2129,9 @@ static int resolv_process_responses(struct dns_nameserver *ns)
 
 	return buflen;
 }
-/* Called when a resolvers network socket is ready to send data */
+/* Called when a dns network socket is ready to send data */
 static void dns_resolve_send(struct dgram_conn *dgram)
 {
-	struct resolvers  *resolvers;
-	struct dns_nameserver *ns;
-	struct resolv_resolution *res;
 	int fd;
 
 	fd = dgram->t.sock.fd;
@@ -2135,46 +2143,6 @@ static void dns_resolve_send(struct dgram_conn *dgram)
 	/* we don't want/need to be waked up any more for sending */
 	fd_stop_send(fd);
 
-	/* no need to go further if we can't retrieve the nameserver */
-	if ((ns = dgram->owner) == NULL)
-		return;
-
-	resolvers = ns->parent;
-	HA_SPIN_LOCK(DNS_LOCK, &resolvers->lock);
-
-	list_for_each_entry(res, &resolvers->resolutions.curr, list) {
-		int ret, len;
-
-		if (res->nb_queries == resolvers->nb_nameservers)
-			continue;
-
-		len = resolv_build_query(res->query_id, res->query_type,
-		                      resolvers->accepted_payload_size,
-		                      res->hostname_dn, res->hostname_dn_len,
-		                      trash.area, trash.size);
-		if (len == -1)
-			goto snd_error;
-
-		ret = send(fd, trash.area, len, 0);
-		if (ret != len) {
-			if (ret == -1 && errno == EAGAIN) {
-				/* retry once the socket is ready */
-				fd_cant_send(fd);
-				continue;
-			}
-			goto snd_error;
-		}
-
-		ns->counters->sent++;
-
-		res->nb_queries++;
-		continue;
-
-	  snd_error:
-		ns->counters->snd_error++;
-		res->nb_queries++;
-	}
-	HA_SPIN_UNLOCK(DNS_LOCK, &resolvers->lock);
 }
 
 /* Processes DNS resolution. First, it checks the active list to detect expired
