@@ -264,35 +264,37 @@ static void resolv_update_resolvers_timeout(struct resolvers *resolvers)
  */
 static int dns_connect_nameserver(struct dns_nameserver *ns)
 {
-	struct dgram_conn *dgram = ns->dgram;
-	int fd;
+	if (ns->dgram) {
+		struct dgram_conn *dgram = ns->dgram;
+		int fd;
 
-	/* Already connected */
-	if (dgram->t.sock.fd != -1)
-		return 0;
+		/* Already connected */
+		if (dgram->t.sock.fd != -1)
+			return 0;
 
-	/* Create an UDP socket and connect it on the nameserver's IP/Port */
-	if ((fd = socket(ns->addr.ss_family, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
-		send_log(NULL, LOG_WARNING,
-			 "DNS : resolvers '%s': can't create socket for nameserver '%s'.\n",
-			 ns->counters->pid, ns->id);
-		return -1;
+		/* Create an UDP socket and connect it on the nameserver's IP/Port */
+		if ((fd = socket(ns->dgram->addr.to.ss_family, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
+			send_log(NULL, LOG_WARNING,
+				 "DNS : resolvers '%s': can't create socket for nameserver '%s'.\n",
+				 ns->counters->pid, ns->id);
+			return -1;
+		}
+		if (connect(fd, (struct sockaddr*)&ns->dgram->addr.to, get_addr_len(&ns->dgram->addr.to)) == -1) {
+			send_log(NULL, LOG_WARNING,
+				 "DNS : resolvers '%s': can't connect socket for nameserver '%s'.\n",
+				 ns->counters->id, ns->id);
+			close(fd);
+			return -1;
+		}
+
+		/* Make the socket non blocking */
+		fcntl(fd, F_SETFL, O_NONBLOCK);
+
+		/* Add the fd in the fd list and update its parameters */
+		dgram->t.sock.fd = fd;
+		fd_insert(fd, dgram, dgram_fd_handler, MAX_THREADS_MASK);
+		fd_want_recv(fd);
 	}
-	if (connect(fd, (struct sockaddr*)&ns->addr, get_addr_len(&ns->addr)) == -1) {
-		send_log(NULL, LOG_WARNING,
-			 "DNS : resolvers '%s': can't connect socket for nameserver '%s'.\n",
-			 ns->counters->id, ns->id);
-		close(fd);
-		return -1;
-	}
-
-	/* Make the socket non blocking */
-	fcntl(fd, F_SETFL, O_NONBLOCK);
-
-	/* Add the fd in the fd list and update its parameters */
-	dgram->t.sock.fd = fd;
-	fd_insert(fd, dgram, dgram_fd_handler, MAX_THREADS_MASK);
-	fd_want_recv(fd);
 	return 0;
 }
 
@@ -2224,7 +2226,7 @@ static struct task *process_resolvers(struct task *t, void *context, unsigned sh
 }
 
 /* proto_udp callback functions for a DNS resolution */
-struct dgram_data_cb resolve_dgram_cb = {
+struct dgram_data_cb dns_dgram_cb = {
 	.recv = dns_resolve_recv,
 	.send = dns_resolve_send,
 };
@@ -2298,41 +2300,25 @@ static int resolvers_finalize_config(void)
 
 		/* Check if we can create the socket with nameservers info */
 		list_for_each_entry(ns, &resolvers->nameservers, list) {
-			struct dgram_conn *dgram = NULL;
 			int fd;
 
-			/* Check nameserver info */
-			if ((fd = socket(ns->addr.ss_family, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
-				ha_alert("config : resolvers '%s': can't create socket for nameserver '%s'.\n",
-					 resolvers->id, ns->id);
-				err_code |= (ERR_ALERT|ERR_ABORT);
-				continue;
-			}
-			if (connect(fd, (struct sockaddr*)&ns->addr, get_addr_len(&ns->addr)) == -1) {
-				ha_alert("config : resolvers '%s': can't connect socket for nameserver '%s'.\n",
-					 resolvers->id, ns->id);
+			if (ns->dgram) {
+				/* Check nameserver info */
+				if ((fd = socket(ns->dgram->addr.to.ss_family, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
+					ha_alert("config : resolvers '%s': can't create socket for nameserver '%s'.\n",
+						 resolvers->id, ns->id);
+					err_code |= (ERR_ALERT|ERR_ABORT);
+					continue;
+				}
+				if (connect(fd, (struct sockaddr*)&ns->dgram->addr.to, get_addr_len(&ns->dgram->addr.to)) == -1) {
+					ha_alert("config : resolvers '%s': can't connect socket for nameserver '%s'.\n",
+						 resolvers->id, ns->id);
+					close(fd);
+					err_code |= (ERR_ALERT|ERR_ABORT);
+					continue;
+				}
 				close(fd);
-				err_code |= (ERR_ALERT|ERR_ABORT);
-				continue;
 			}
-			close(fd);
-
-			/* Create dgram structure that will hold the UPD socket
-			 * and attach it on the current nameserver */
-			if ((dgram = calloc(1, sizeof(*dgram))) == NULL) {
-				ha_alert("config: resolvers '%s' : out of memory.\n",
-					 resolvers->id);
-				err_code |= (ERR_ALERT|ERR_ABORT);
-				goto err;
-			}
-
-			/* Leave dgram partially initialized, no FD attached for
-			 * now. */
-			dgram->owner     = ns;
-			dgram->data      = &resolve_dgram_cb;
-			dgram->t.sock.fd = -1;
-			ns->dgram        = dgram;
-
 		}
 
 		/* Create the task associated to the resolvers section */
@@ -3043,20 +3029,6 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 			}
 		}
 
-		if ((newnameserver = calloc(1, sizeof(*newnameserver))) == NULL) {
-			ha_alert("parsing [%s:%d] : out of memory.\n", file, linenum);
-			err_code |= ERR_ALERT | ERR_ABORT;
-			goto out;
-		}
-
-		/* the nameservers are linked backward first */
-		LIST_ADDQ(&curr_resolvers->nameservers, &newnameserver->list);
-		newnameserver->parent = curr_resolvers;
-		newnameserver->process_responses = resolv_process_responses;
-		newnameserver->conf.file = strdup(file);
-		newnameserver->conf.line = linenum;
-		newnameserver->id = strdup(args[1]);
-
 		sk = str2sa_range(args[2], NULL, &port1, &port2, NULL, NULL,
 		                  &errmsg, NULL, NULL, PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_DGRAM);
 		if (!sk) {
@@ -3065,7 +3037,35 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		newnameserver->addr = *sk;
+		if ((newnameserver = calloc(1, sizeof(*newnameserver))) == NULL) {
+			ha_alert("parsing [%s:%d] : out of memory.\n", file, linenum);
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
+
+		if (dns_dgram_init(newnameserver, sk) < 0) {
+			ha_alert("parsing [%s:%d] : out of memory.\n", file, linenum);
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
+
+		if ((newnameserver->conf.file = strdup(file)) == NULL) {
+			ha_alert("parsing [%s:%d] : out of memory.\n", file, linenum);
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
+
+		if ((newnameserver->id = strdup(args[1])) == NULL) {
+			ha_alert("parsing [%s:%d] : out of memory.\n", file, linenum);
+			err_code |= ERR_ALERT | ERR_ABORT;
+			goto out;
+		}
+
+		newnameserver->parent = curr_resolvers;
+		newnameserver->process_responses = resolv_process_responses;
+		newnameserver->conf.line = linenum;
+		/* the nameservers are linked backward first */
+		LIST_ADDQ(&curr_resolvers->nameservers, &newnameserver->list);
 	}
 	else if (strcmp(args[0], "parse-resolv-conf") == 0) {
 		struct dns_nameserver *newnameserver = NULL;
@@ -3153,6 +3153,13 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 				goto resolv_out;
 			}
 
+			if (dns_dgram_init(newnameserver, sk) < 0) {
+				ha_alert("parsing [/etc/resolv.conf:%d] : out of memory.\n", resolv_linenum);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				free(newnameserver);
+				goto resolv_out;
+			}
+
 			newnameserver->conf.file = strdup("/etc/resolv.conf");
 			if (newnameserver->conf.file == NULL) {
 				ha_alert("parsing [/etc/resolv.conf:%d] : out of memory.\n", resolv_linenum);
@@ -3173,8 +3180,6 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 			newnameserver->parent = curr_resolvers;
 			newnameserver->process_responses = resolv_process_responses;
 			newnameserver->conf.line = resolv_linenum;
-			newnameserver->addr = *sk;
-
 			LIST_ADDQ(&curr_resolvers->nameservers, &newnameserver->list);
 		}
 
@@ -3327,6 +3332,24 @@ resolv_out:
  out:
 	free(errmsg);
 	return err_code;
+}
+
+int dns_dgram_init(struct dns_nameserver *ns, struct sockaddr_storage *sk)
+{
+	struct dgram_conn *dgram;
+
+	 if ((dgram = calloc(1, sizeof(*dgram))) == NULL)
+		return -1;
+
+	/* Leave dgram partially initialized, no FD attached for
+	 * now. */
+	dgram->owner     = ns;
+	dgram->data      = &dns_dgram_cb;
+	dgram->t.sock.fd = -1;
+	dgram->addr.to = *sk;
+	ns->dgram = dgram;
+
+	return 0;
 }
 
 REGISTER_CONFIG_SECTION("resolvers",      cfg_parse_resolvers, NULL);

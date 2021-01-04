@@ -209,7 +209,6 @@ struct dns_nameserver {
 
 	int (*process_responses)(struct dns_nameserver *ns); /* callback used to process responses */
 	struct dgram_conn      *dgram;  /* transport layer */
-	struct sockaddr_storage addr;   /* IP address */
 
 	EXTRA_COUNTERS(extra_counters);
 	struct dns_counters *counters;

@@ -53,5 +53,6 @@ int stats_dump_dns(struct stream_interface *si,
                    struct list *stat_modules);
 void dns_stats_clear_counters(int clrall, struct list *stat_modules);
 int dns_allocate_counters(struct list *stat_modules);
+int dns_dgram_init(struct dns_nameserver *ns, struct sockaddr_storage *sk);
 
 #endif // _HAPROXY_DNS_H
