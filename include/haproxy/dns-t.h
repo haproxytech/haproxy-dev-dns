@@ -207,6 +207,7 @@ struct dns_nameserver {
 		int         line;       /* line where the section appears */
 	} conf;                         /* config information */
 
+	int (*process_responses)(struct dns_nameserver *ns); /* callback used to process responses */
 	struct dgram_conn      *dgram;  /* transport layer */
 	struct sockaddr_storage addr;   /* IP address */
 

@@ -744,6 +744,34 @@ static void resolv_check_response(struct resolv_resolution *res)
 	}
 }
 
+/* Receives a dns message
+ * Returns message length
+ * 0 is returned if no more message available
+ * -1 in error case
+ */
+ssize_t dns_recv_nameserver(struct dns_nameserver *ns, void *data, size_t size)
+{
+        ssize_t ret = -1;
+
+	if (ns->dgram) {
+		int fd = ns->dgram->t.sock.fd;
+
+		if (fd == -1)
+			return -1;
+
+		if ((ret = recv(fd, data, size, 0)) < 0) {
+			if (errno == EAGAIN)
+				return 0;
+			fd_delete(fd);
+			close(fd);
+			ns->dgram->t.sock.fd = -1;
+			return -1;
+		}
+	}
+
+	return ret;
+}
+
 /* Validates that the buffer DNS response provided in <resp> and finishing
  * before <bufend> is valid from a DNS protocol point of view.
  *
@@ -1866,17 +1894,9 @@ void resolv_unlink_resolution(struct resolv_requester *requester)
 	}
 }
 
-/* Called when a network IO is generated on a name server socket for an incoming
- * packet. It performs the following actions:
- *  - check if the packet requires processing (not outdated resolution)
- *  - ensure the DNS packet received is valid and call requester's callback
- *  - call requester's error callback if invalid response
- *  - check the dn_name in the packet against the one sent
- */
 static void dns_resolve_recv(struct dgram_conn *dgram)
 {
 	struct dns_nameserver *ns;
-	struct dns_counters   *tmpcounters;
 	struct resolvers  *resolvers;
 	struct resolv_resolution *res;
 	struct resolv_query_item *query;
@@ -1901,20 +1921,46 @@ static void dns_resolve_recv(struct dgram_conn *dgram)
 		return;
 	}
 
+	if (ns->process_responses(ns) <= 0) {
+		/* FIXME : for now we consider EAGAIN only, but at
+		 * least we purge sticky errors that would cause us to
+		 * be called in loops.
+		 */
+		_HA_ATOMIC_AND(&fdtab[fd].ev, ~(FD_POLL_HUP|FD_POLL_ERR));
+		fd_cant_recv(fd);
+	}
+}
+
+/* Called when a network IO is generated on a name server socket for an incoming
+ * packet. It performs the following actions:
+ *  - check if the packet requires processing (not outdated resolution)
+ *  - ensure the DNS packet received is valid and call requester's callback
+ *  - call requester's error callback if invalid response
+ *  - check the dn_name in the packet against the one sent
+ */
+static int resolv_process_responses(struct dns_nameserver *ns)
+{
+	struct dns_counters   *tmpcounters;
+	struct resolvers  *resolvers;
+	struct resolv_resolution *res;
+	struct resolv_query_item *query;
+	unsigned char  buf[DNS_MAX_UDP_MESSAGE + 1];
+	unsigned char *bufend;
+	int buflen, dns_resp;
+	int max_answer_records;
+	unsigned short query_id;
+	struct eb32_node *eb;
+	struct resolv_requester *req;
+
 	resolvers = ns->parent;
 	HA_SPIN_LOCK(DNS_LOCK, &resolvers->lock);
 
 	/* process all pending input messages */
-	while (fd_recv_ready(fd)) {
+	while (1) {
 		/* read message received */
 		memset(buf, '\0', resolvers->accepted_payload_size + 1);
-		if ((buflen = recv(fd, (char*)buf , resolvers->accepted_payload_size + 1, 0)) < 0) {
-			/* FIXME : for now we consider EAGAIN only, but at
-			 * least we purge sticky errors that would cause us to
-			 * be called in loops.
-			 */
-			_HA_ATOMIC_AND(&fdtab[fd].ev, ~(FD_POLL_HUP|FD_POLL_ERR));
-			fd_cant_recv(fd);
+		if ((buflen = dns_recv_nameserver(ns, (void *)buf, sizeof(buf))) <= 0) {
+			/* TO DO: handle error case */
 			break;
 		}
 
@@ -2069,8 +2115,9 @@ static void dns_resolve_recv(struct dgram_conn *dgram)
 	}
 	resolv_update_resolvers_timeout(resolvers);
 	HA_SPIN_UNLOCK(DNS_LOCK, &resolvers->lock);
-}
 
+	return buflen;
+}
 /* Called when a resolvers network socket is ready to send data */
 static void dns_resolve_send(struct dgram_conn *dgram)
 {
@@ -3037,6 +3084,7 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 		/* the nameservers are linked backward first */
 		LIST_ADDQ(&curr_resolvers->nameservers, &newnameserver->list);
 		newnameserver->parent = curr_resolvers;
+		newnameserver->process_responses = resolv_process_responses;
 		newnameserver->conf.file = strdup(file);
 		newnameserver->conf.line = linenum;
 		newnameserver->id = strdup(args[1]);
@@ -3155,6 +3203,7 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 			}
 
 			newnameserver->parent = curr_resolvers;
+			newnameserver->process_responses = resolv_process_responses;
 			newnameserver->conf.line = resolv_linenum;
 			newnameserver->addr = *sk;
 
