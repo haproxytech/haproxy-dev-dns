@@ -34,6 +34,9 @@
 /* DNS header size */
 #define DNS_HEADER_SIZE  ((int)sizeof(struct dns_header))
 
+/* max pending requests per stream */
+#define DNS_STREAM_MAX_SLOTS    4
+
 /* DNS request or response header structure */
 struct dns_header {
 	uint16_t id;
@@ -64,6 +67,42 @@ struct dns_additional_record {
  * structure which itself should point to different type of data, based on the
  * extension set (client subnet, tcp keepalive, etc...)*/
 } __attribute__ ((packed));
+
+/* Structure describing a name server used during name resolution.
+ * A name server belongs to a resolvers section.
+ */
+struct dns_stream_server {
+	struct server *srv;
+	struct ring *ring_req;
+	struct ring *ring_rsp;
+	int max_slots;
+	int maxconn;
+	size_t ofs_req;           // ring buffer reader offset
+	size_t ofs_rsp;           // ring buffer reader offset
+	struct task *task_req;    /* req conn management */
+	struct task *task_rsp;    /* rsp management */
+	struct list sessions;
+	struct list full;
+	__decl_thread(HA_SPINLOCK_T lock); // lock to protect current struct
+};
+
+struct dns_query {
+	struct eb32_node qid;
+	uint16_t original_qid;
+};
+
+struct dns_session {
+	struct ring *ring;
+	size_t ofs;            // ring buffer reader offset
+	struct appctx *appctx; // appctx of current session
+	struct dns_stream_server *dss;
+	int used_slots;
+	int queued_slots;
+	int query_counter;
+	struct list list;
+	struct eb_root query_ids; /* tree to quickly lookup/retrieve query ids currently in use */
+	__decl_thread(HA_SPINLOCK_T lock); // lock to protect current struct
+};
 
 struct dns_counters {
 	char *id;
@@ -98,6 +137,7 @@ struct dns_nameserver {
 
 	int (*process_responses)(struct dns_nameserver *ns); /* callback used to process responses */
 	struct dgram_conn      *dgram;  /* transport layer */
+	struct dns_stream_server *stream; /* used for tcp dns */
 
 	EXTRA_COUNTERS(extra_counters);
 	struct dns_counters *counters;

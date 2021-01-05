@@ -30,7 +30,11 @@
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/log.h>
+#include <haproxy/ring.h>
+#include <haproxy/stream.h>
+#include <haproxy/stream_interface.h>
 
+static THREAD_LOCAL char tmp_dns_buf[65535];
 
 /* Opens an UDP socket on the namesaver's IP/Port, if required. Returns 0 on
  * success, -1 otherwise.
@@ -78,7 +82,7 @@ static int dns_connect_nameserver(struct dns_nameserver *ns)
  */
 int dns_send_nameserver(struct dns_nameserver *ns, void *buf, size_t len)
 {
-	int ret;
+	int ret = -1;
 
 	if (ns->dgram) {
 		int fd = ns->dgram->t.sock.fd;
@@ -97,6 +101,17 @@ int dns_send_nameserver(struct dns_nameserver *ns, void *buf, size_t len)
 			fd_delete(fd);
 			close(fd);
 			ns->dgram->t.sock.fd = -1;
+		}
+	}
+	else if (ns->stream) {
+		struct ist myist;
+
+		myist.ptr = buf;
+		myist.len = len;
+                ret = ring_write(ns->stream->ring_req, 65535, NULL, 0, &myist, 1);
+		if (ret) {
+			task_wakeup(ns->stream->task_req, TASK_WOKEN_MSG);
+			return ret;
 		}
 	}
 
@@ -126,6 +141,73 @@ ssize_t dns_recv_nameserver(struct dns_nameserver *ns, void *data, size_t size)
 			ns->dgram->t.sock.fd = -1;
 			return -1;
 		}
+	}
+	else if (ns->stream) {
+		struct dns_stream_server *dss = ns->stream;
+		struct ring *ring = dss->ring_rsp;
+		struct buffer *buf = &ring->buf;
+		uint64_t msg_len;
+		size_t len, cnt, ofs;
+
+		HA_SPIN_LOCK(DNS_LOCK, &dss->lock);
+
+		ofs = dss->ofs_rsp;
+
+		HA_RWLOCK_RDLOCK(DNS_LOCK, &ring->lock);
+
+		/* explanation for the initialization below: it would be better to do
+		 * this in the parsing function but this would occasionally result in
+		 * dropped events because we'd take a reference on the oldest message
+		 * and keep it while being scheduled. Thus instead let's take it the
+		 * first time we enter here so that we have a chance to pass many
+		 * existing messages before grabbing a reference to a location. This
+		 * value cannot be produced after initialization.
+		 */
+		if (unlikely(ofs == ~0)) {
+			ofs = 0;
+
+			HA_ATOMIC_ADD(b_peek(buf, ofs), 1);
+			ofs += ring->ofs;
+		}
+
+		/* we were already there, adjust the offset to be relative to
+		 * the buffer's head and remove us from the counter.
+		 */
+		ofs -= ring->ofs;
+		BUG_ON(ofs >= buf->size);
+		HA_ATOMIC_SUB(b_peek(buf, ofs), 1);
+
+		if (ofs + 1 >= b_data(buf)) {
+			HA_ATOMIC_ADD(b_peek(buf, ofs), 1);
+			ofs += ring->ofs;
+			dss->ofs_rsp= ofs;
+			HA_RWLOCK_RDUNLOCK(DNS_LOCK, &ring->lock);
+			HA_SPIN_UNLOCK(DNS_LOCK, &dss->lock);
+			return 0;
+		}
+
+		cnt = 1;
+		len = b_peek_varint(buf, ofs + cnt, &msg_len);
+		if (!len) {
+			HA_ATOMIC_ADD(b_peek(buf, ofs), 1);
+			ofs += ring->ofs;
+			dss->ofs_rsp= ofs;
+			HA_RWLOCK_RDUNLOCK(DNS_LOCK, &ring->lock);
+			HA_SPIN_UNLOCK(DNS_LOCK, &dss->lock);
+			return 0;
+		}
+
+		cnt += len;
+		BUG_ON(msg_len + ofs + cnt + 1 > b_data(buf));
+
+		ret = b_getblk(buf, data, msg_len < size ? msg_len : size, ofs + cnt);
+
+		ofs += cnt + ret;
+		HA_ATOMIC_ADD(b_peek(buf, ofs), 1);
+		ofs += ring->ofs;
+		dss->ofs_rsp= ofs;
+		HA_RWLOCK_RDUNLOCK(DNS_LOCK, &ring->lock);
+		HA_SPIN_UNLOCK(DNS_LOCK, &dss->lock);
 	}
 
 	return ret;
@@ -208,3 +290,492 @@ int dns_dgram_init(struct dns_nameserver *ns, struct sockaddr_storage *sk)
 	return 0;
 }
 
+/*
+ * IO Handler to handle message push to dns tcp server
+ */
+static void dns_session_io_handler(struct appctx *appctx)
+{
+	struct stream_interface *si = appctx->owner;
+	struct dns_session *ds = appctx->ctx.sft.ptr;
+	struct ring *ring = ds->ring;
+	struct buffer *buf = &ring->buf;
+	uint64_t msg_len;
+	size_t len, cnt, ofs;
+	int ret = 0;
+
+	/* if stopping was requested, close immediately */
+	if (unlikely(stopping))
+		goto close;
+
+	/* for rex because it seems reset to timeout
+	 * and we don't want expire on this case
+	 * with a syslog server
+	 */
+	si_oc(si)->rex = TICK_ETERNITY;
+	/* rto should not change but it seems the case */
+	si_oc(si)->rto = TICK_ETERNITY;
+
+	/* an error was detected */
+	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+		goto close;
+
+	/* con closed by server side */
+	if ((si_oc(si)->flags & CF_SHUTW))
+		goto close;
+
+	/* if the connection is not established, inform the stream that we want
+	 * to be notified whenever the connection completes.
+	 */
+	if (si_opposite(si)->state < SI_ST_EST) {
+		si_cant_get(si);
+		si_rx_conn_blk(si);
+		si_rx_endp_more(si);
+		return;
+	}
+
+	HA_SPIN_LOCK(SFT_LOCK, &ds->lock);
+	if (appctx != ds->appctx) {
+		HA_SPIN_UNLOCK(SFT_LOCK, &ds->lock);
+		goto close;
+	}
+	ofs = ds->ofs;
+
+	HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &ring->lock);
+	LIST_DEL_INIT(&appctx->wait_entry);
+	HA_RWLOCK_WRUNLOCK(LOGSRV_LOCK, &ring->lock);
+
+	HA_RWLOCK_RDLOCK(LOGSRV_LOCK, &ring->lock);
+
+	/* explanation for the initialization below: it would be better to do
+	 * this in the parsing function but this would occasionally result in
+	 * dropped events because we'd take a reference on the oldest message
+	 * and keep it while being scheduled. Thus instead let's take it the
+	 * first time we enter here so that we have a chance to pass many
+	 * existing messages before grabbing a reference to a location. This
+	 * value cannot be produced after initialization.
+	 */
+	if (unlikely(ofs == ~0)) {
+		ofs = 0;
+
+		HA_ATOMIC_ADD(b_peek(buf, ofs), 1);
+		ofs += ring->ofs;
+	}
+
+	/* in this loop, ofs always points to the counter byte that precedes
+	 * the message so that we can take our reference there if we have to
+	 * stop before the end (ret=0).
+	 */
+	if (si_opposite(si)->state == SI_ST_EST) {
+		/* we were already there, adjust the offset to be relative to
+		 * the buffer's head and remove us from the counter.
+		 */
+		ofs -= ring->ofs;
+		BUG_ON(ofs >= buf->size);
+		HA_ATOMIC_SUB(b_peek(buf, ofs), 1);
+
+		ret = 1;
+		while (ofs + 1 < b_data(buf)) {
+			struct dns_query *query;
+			uint16_t original_qid;
+			uint16_t new_qid;
+
+			cnt = 1;
+			len = b_peek_varint(buf, ofs + cnt, &msg_len);
+			if (!len)
+				break;
+			cnt += len;
+			BUG_ON(msg_len + ofs + cnt + 1 > b_data(buf));
+
+			if (unlikely(2 + msg_len > b_size(&trash))) {
+				/* too large a message to ever fit, let's skip it */
+				ofs += cnt + msg_len;
+				continue;
+			}
+
+			chunk_reset(&trash);
+			trash.area[0] = (msg_len >> 8) & 0xff;
+			trash.area[1] = msg_len & 0xff;
+			trash.data += 2;
+			len = b_getblk(buf, trash.area + 2, msg_len, ofs + cnt);
+			trash.data += len;
+			memcpy(&original_qid, trash.area + 2, 2);
+			new_qid = ++ds->query_counter;
+			new_qid = htons(new_qid);
+			memcpy(trash.area + 2, &new_qid, 2);
+
+			if (ci_putchk(si_ic(si), &trash) == -1) {
+				si_rx_room_blk(si);
+				ret = 0;
+				break;
+			}
+			query = calloc(1, sizeof(struct dns_query));
+			query->qid.key = new_qid;
+			query->original_qid = original_qid;
+			eb32_insert(&ds->query_ids, &query->qid);
+			ds->queued_slots--;
+			ofs += cnt + msg_len;
+		}
+
+		HA_ATOMIC_ADD(b_peek(buf, ofs), 1);
+		ofs += ring->ofs;
+		ds->ofs = ofs;
+	}
+	HA_RWLOCK_RDUNLOCK(LOGSRV_LOCK, &ring->lock);
+
+	if (ret) {
+		/* let's be woken up once new data arrive */
+		HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &ring->lock);
+		LIST_ADDQ(&ring->waiters, &appctx->wait_entry);
+		HA_RWLOCK_WRUNLOCK(LOGSRV_LOCK, &ring->lock);
+		si_rx_endp_done(si);
+	}
+
+	while (si_oc(si)->output) {
+		uint16_t query_id;
+		struct eb32_node *eb;
+		struct dns_query *query;
+
+		if (co_getblk(si_oc(si), (char *)&msg_len, 2, 0) <= 0) {
+			goto incomplete;
+		}
+
+		msg_len = ntohs(msg_len);
+		if (co_getblk(si_oc(si), tmp_dns_buf, msg_len, 2) <= 0) {
+			goto incomplete;
+		}
+
+		memcpy(&query_id, tmp_dns_buf, 2);
+
+
+		eb = eb32_lookup(&ds->query_ids, query_id);
+		if (eb) {
+			struct ist myist;
+			query = eb32_entry(eb, struct dns_query, qid);
+
+			memcpy(tmp_dns_buf, &query->original_qid, 2);
+			eb32_delete(&query->qid);
+			/* we need to lock dss, but we dont want
+			 * dead lock so we firstly release
+			 * dns_session lock */
+			HA_SPIN_UNLOCK(SFT_LOCK, &ds->lock);
+
+			/* we lock both dss and session lock */
+
+			HA_SPIN_LOCK(SFT_LOCK, &ds->dss->lock);
+			HA_SPIN_LOCK(SFT_LOCK, &ds->lock);
+			ds->used_slots--;
+			LIST_DEL(&ds->list);
+			if (ds->used_slots)
+				LIST_ADD(&ds->dss->sessions, &ds->list);
+			else
+				LIST_ADDQ(&ds->dss->sessions, &ds->list);
+
+			myist.ptr = tmp_dns_buf;
+			myist.len = msg_len;
+			ring_write(ds->dss->ring_rsp, 65535, NULL, 0, &myist, 1);
+			task_wakeup(ds->dss->task_rsp, TASK_WOKEN_INIT);
+			/* we can release dss but we keep lock on session
+			 * until the end */
+			HA_SPIN_UNLOCK(SFT_LOCK, &ds->dss->lock);
+
+		}
+
+		/* always drain data from server */
+		co_skip(si_oc(si), 2 + msg_len);
+	}
+incomplete:
+	HA_SPIN_UNLOCK(SFT_LOCK, &ds->lock);
+	return;
+close:
+	si_shutw(si);
+	si_shutr(si);
+	si_ic(si)->flags |= CF_READ_NULL;
+}
+
+
+/*
+ * Function to release a DNS tcp session
+ */
+static void dns_session_release(struct appctx *appctx)
+{
+	struct dns_session *ds = appctx->ctx.peers.ptr;
+
+	if (!ds)
+		return;
+
+	HA_SPIN_LOCK(DNS_LOCK, &ds->lock);
+	if (ds->appctx == appctx) {
+		HA_RWLOCK_WRLOCK(DNS_LOCK, &ds->ring->lock);
+		LIST_DEL_INIT(&ds->appctx->wait_entry);
+		HA_RWLOCK_WRUNLOCK(DNS_LOCK, &ds->ring->lock);
+
+		ds->appctx = NULL;
+		task_wakeup(ds->dss->task_req, TASK_WOKEN_MSG);
+	}
+	HA_SPIN_UNLOCK(DNS_LOCK, &ds->lock);
+}
+
+/* DNS tcp session applet */
+static struct applet dns_session_applet = {
+	.obj_type = OBJ_TYPE_APPLET,
+	.name = "<STRMDNS>", /* used for logging */
+	.fct = dns_session_io_handler,
+	.release = dns_session_release,
+};
+
+/*
+ * Function used to create an appctx for a DNS session
+ */
+static struct appctx *dns_session_create(struct dns_session *ds)
+{
+	struct appctx *appctx;
+	struct session *sess;
+	struct stream *s;
+	struct applet *applet = &dns_session_applet;
+
+	appctx = appctx_new(applet, tid_bit);
+	if (!appctx)
+		goto out_close;
+
+	appctx->ctx.sft.ptr = (void *)ds;
+
+	sess = session_new(ds->dss->srv->proxy, NULL, &appctx->obj_type);
+	if (!sess) {
+		ha_alert("out of memory in peer_session_create().\n");
+		goto out_free_appctx;
+	}
+
+	if ((s = stream_new(sess, &appctx->obj_type, &BUF_NULL)) == NULL) {
+		ha_alert("Failed to initialize stream in peer_session_create().\n");
+		goto out_free_sess;
+	}
+
+
+	s->target = &ds->dss->srv->obj_type;
+	if (!sockaddr_alloc(&s->target_addr, &ds->dss->srv->addr, sizeof(ds->dss->srv->addr)))
+		goto out_free_strm;
+	s->flags = SF_ASSIGNED|SF_ADDR_SET;
+	s->si[1].flags |= SI_FL_NOLINGER;
+
+	s->do_log = NULL;
+	s->uniq_id = 0;
+
+	s->res.flags |= CF_READ_DONTWAIT;
+	/* for rto and rex to eternity to not expire on idle recv:
+	 * We are using a syslog server.
+	 */
+	s->res.rto = TICK_ETERNITY;
+	s->res.rex = TICK_ETERNITY;
+	ds->appctx = appctx;
+	task_wakeup(s->task, TASK_WOKEN_INIT);
+	return appctx;
+
+	/* Error unrolling */
+ out_free_strm:
+	LIST_DEL(&s->list);
+	pool_free(pool_head_stream, s);
+ out_free_sess:
+	session_free(sess);
+ out_free_appctx:
+	appctx_free(appctx);
+ out_close:
+	return NULL;
+}
+
+/*
+ * Task used to consume pending messages from nameserver ring
+ * and forward them to dns_session ring.
+ * Note: If no slot found a new dns_session is allocated
+ */
+static struct task *dns_process_req(struct task *t, void *context, unsigned short state)
+{
+	struct dns_nameserver *ns = (struct dns_nameserver *)context;
+	struct dns_stream_server *dss = ns->stream;
+	struct ring *ring = dss->ring_req;
+	struct buffer *buf = &ring->buf;
+	uint64_t msg_len;
+	size_t len, cnt, ofs;
+	struct dns_session *ds;
+
+	HA_SPIN_LOCK(DNS_LOCK, &dss->lock);
+
+	ofs = dss->ofs_req;
+
+	HA_RWLOCK_RDLOCK(DNS_LOCK, &ring->lock);
+
+	/* explanation for the initialization below: it would be better to do
+	 * this in the parsing function but this would occasionally result in
+	 * dropped events because we'd take a reference on the oldest message
+	 * and keep it while being scheduled. Thus instead let's take it the
+	 * first time we enter here so that we have a chance to pass many
+	 * existing messages before grabbing a reference to a location. This
+	 * value cannot be produced after initialization.
+	 */
+	if (unlikely(ofs == ~0)) {
+		ofs = 0;
+		HA_ATOMIC_ADD(b_peek(buf, ofs), 1);
+		ofs += ring->ofs;
+	}
+
+	/* we were already there, adjust the offset to be relative to
+	 * the buffer's head and remove us from the counter.
+	 */
+	ofs -= ring->ofs;
+	BUG_ON(ofs >= buf->size);
+	HA_ATOMIC_SUB(b_peek(buf, ofs), 1);
+
+	while (ofs + 1 < b_data(buf)) {
+		cnt = 1;
+		len = b_peek_varint(buf, ofs + cnt, &msg_len);
+		if (!len)
+			break;
+		cnt += len;
+		BUG_ON(msg_len + ofs + cnt + 1 > b_data(buf));
+		if (unlikely(msg_len > sizeof(tmp_dns_buf))) {
+			/* too large a message to ever fit, let's skip it */
+			ofs += cnt + msg_len;
+			continue;
+		}
+
+		len = b_getblk(buf, tmp_dns_buf, msg_len, ofs + cnt);
+		if (LIST_ISEMPTY(&dss->sessions)) {
+			ds = calloc(1, sizeof (*ds));
+			ds->ring = ring_new(65535);
+			ds->ofs = ~0;
+			ds->dss = dss;
+			LIST_INIT(&ds->list);
+			HA_SPIN_INIT(&ds->lock);
+			ds->appctx = dns_session_create(ds);
+			ring_attach(ds->ring);
+			HA_SPIN_LOCK(DNS_LOCK, &ds->lock);
+		}
+		else {
+			ds = LIST_NEXT(&dss->sessions, struct dns_session *, list);
+			HA_SPIN_LOCK(DNS_LOCK, &ds->lock);
+			LIST_DEL(&ds->list);
+		}
+
+		{
+			struct ist myist;
+			myist.ptr = tmp_dns_buf;
+			myist.len = len;
+			ring_write(ds->ring, 65535, NULL, 0, &myist, 1);
+			ds->used_slots++;
+			ds->queued_slots++;
+			if (ds->used_slots >= DNS_STREAM_MAX_SLOTS)
+				LIST_ADD(&dss->full, &ds->list);
+			else
+				LIST_ADD(&dss->sessions, &ds->list);
+		}
+		HA_SPIN_UNLOCK(DNS_LOCK, &ds->lock);
+		ofs += cnt + len;
+	}
+
+	HA_ATOMIC_ADD(b_peek(buf, ofs), 1);
+	ofs += ring->ofs;
+	dss->ofs_req = ofs;
+	HA_RWLOCK_RDUNLOCK(DNS_LOCK, &ring->lock);
+
+
+	HA_SPIN_UNLOCK(DNS_LOCK, &dss->lock);
+	return t;
+}
+
+/*
+ * Task used to consume response
+ * Note: upper layer callback is called
+ */
+static struct task *dns_process_rsp(struct task *t, void *context, unsigned short state)
+{
+	struct dns_nameserver *ns = (struct dns_nameserver *)context;
+
+	ns->process_responses(ns);
+
+	return t;
+}
+
+/* Function used to initialize an TCP nameserver */
+int dns_stream_init(struct dns_nameserver *ns, struct server *srv)
+{
+	struct dns_stream_server *dss = NULL;
+	int err_code;
+
+        dss = calloc(1, sizeof(*dss));
+        if (!dss) {
+		ha_alert("memory allocation error initializing dns tcp server '%s'.\n", srv->id);
+		         err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+	dss->srv = srv;
+
+	dss->ofs_req = ~0; /* init ring offset */
+	dss->ring_req = ring_new(65535);
+	if (!dss->ring_req) {
+		ha_alert("memory allocation error initializing the ring for dns tcp server '%s'.\n", srv->id);
+		         err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+	/* Create the task associated to the resolver target handling conns */
+	if ((dss->task_req = task_new(MAX_THREADS_MASK)) == NULL) {
+		ha_alert("memory allocation error initializing the ring for dns tcp server '%s'.\n", srv->id);
+		         err_code |= (ERR_ALERT|ERR_ABORT);
+		goto out;
+	}
+
+	/* Update task's parameters */
+	dss->task_req->process = dns_process_req;
+	dss->task_req->context = ns;
+
+	/* attach the task as reader */
+	if (!ring_attach(dss->ring_req)) {
+		/* mark server attached to the ring */
+		ha_alert("server '%s' sets too many watchers > 255 on ring.\n", srv->id);
+		         err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+	dss->ofs_rsp = ~0; /* init ring offset */
+	dss->ring_rsp = ring_new(65535);
+	if (!dss->ring_rsp) {
+		ha_alert("memory allocation error initializing the ring for dns tcp server '%s'.\n", srv->id);
+		         err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+	/* Create the task associated to the resolver target handling conns */
+	if ((dss->task_rsp = task_new(MAX_THREADS_MASK)) == NULL) {
+		ha_alert("memory allocation error initializing the ring for dns tcp server '%s'.\n", srv->id);
+		         err_code |= (ERR_ALERT|ERR_ABORT);
+		goto out;
+	}
+
+	/* Update task's parameters */
+	dss->task_rsp->process = dns_process_rsp;
+	dss->task_rsp->context = ns;
+
+	/* attach the task as reader */
+	if (!ring_attach(dss->ring_rsp)) {
+		/* mark server attached to the ring */
+		ha_alert("server '%s' sets too many watchers > 255 on ring.\n", srv->id);
+		         err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+	LIST_INIT(&dss->sessions);
+	LIST_INIT(&dss->full);
+	HA_SPIN_INIT(&dss->lock);
+	ns->stream = dss;
+	return 0;
+out:
+	if (dss && dss->task_rsp)
+		task_destroy(dss->task_rsp);
+	if (dss && dss->ring_rsp)
+		ring_free(dss->ring_rsp);
+	if (dss && dss->task_req)
+		task_destroy(dss->task_req);
+	if (dss && dss->ring_req)
+		ring_free(dss->ring_req);
+
+	free(dss);
+	return -1;
+}
