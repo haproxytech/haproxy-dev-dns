@@ -90,7 +90,6 @@
 #include <haproxy/chunk.h>
 #include <haproxy/cli.h>
 #include <haproxy/connection.h>
-#include <haproxy/dns.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
@@ -112,6 +111,7 @@
 #include <haproxy/proto_tcp.h>
 #include <haproxy/proxy.h>
 #include <haproxy/regex.h>
+#include <haproxy/resolvers.h>
 #include <haproxy/sample.h>
 #include <haproxy/server.h>
 #include <haproxy/session.h>

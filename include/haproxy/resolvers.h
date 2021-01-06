@@ -23,7 +23,7 @@
 #define _HAPROXY_DNS_H
 
 #include <haproxy/action-t.h>
-#include <haproxy/dns-t.h>
+#include <haproxy/resolvers-t.h>
 
 extern struct list sec_resolvers;
 extern unsigned int resolv_failed_resolutions;

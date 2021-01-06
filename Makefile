@@ -845,7 +845,7 @@ OBJS += src/mux_h2.o src/mux_fcgi.o src/http_ana.o src/stream.o                \
         src/mux_h1.o src/stats.o src/flt_spoe.o src/backend.o                  \
         src/tcpcheck.o src/server.o src/tools.o src/cli.o                      \
         src/cfgparse.o src/log.o src/cfgparse-listen.o src/check.o             \
-        src/stick_table.o src/peers.o src/dns.o src/stream_interface.o         \
+        src/stick_table.o src/peers.o src/resolvers.o src/stream_interface.o   \
         src/sample.o src/http_htx.o src/haproxy.o src/http_act.o               \
         src/proxy.o src/pattern.o src/listener.o src/cache.o                   \
         src/http_fetch.o src/session.o src/connection.o src/sink.o             \

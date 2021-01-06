@@ -26,7 +26,6 @@
 #include <haproxy/check.h>
 #include <haproxy/cli.h>
 #include <haproxy/dgram.h>
-#include <haproxy/dns.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
@@ -35,6 +34,7 @@
 #include <haproxy/net_helper.h>
 #include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
+#include <haproxy/resolvers.h>
 #include <haproxy/sample.h>
 #include <haproxy/server.h>
 #include <haproxy/stats.h>
