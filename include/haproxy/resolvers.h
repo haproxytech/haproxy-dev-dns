@@ -19,8 +19,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#ifndef _HAPROXY_DNS_H
-#define _HAPROXY_DNS_H
+#ifndef _HAPROXY_RESOLVERS_H
+#define _HAPROXY_RESOLVERS_H
 
 #include <haproxy/action-t.h>
 #include <haproxy/resolvers-t.h>
@@ -55,4 +55,4 @@ void resolv_stats_clear_counters(int clrall, struct list *stat_modules);
 int resolv_allocate_counters(struct list *stat_modules);
 int dns_dgram_init(struct dns_nameserver *ns, struct sockaddr_storage *sk);
 
-#endif // _HAPROXY_DNS_H
+#endif // _HAPROXY_RESOLVER_H

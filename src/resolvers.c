@@ -25,7 +25,7 @@
 #include <haproxy/channel.h>
 #include <haproxy/check.h>
 #include <haproxy/cli.h>
-#include <haproxy/dgram.h>
+#include <haproxy/dns.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
@@ -259,45 +259,6 @@ static void resolv_update_resolvers_timeout(struct resolvers *resolvers)
 	task_queue(resolvers->t);
 }
 
-/* Opens an UDP socket on the namesaver's IP/Port, if required. Returns 0 on
- * success, -1 otherwise.
- */
-static int dns_connect_nameserver(struct dns_nameserver *ns)
-{
-	if (ns->dgram) {
-		struct dgram_conn *dgram = ns->dgram;
-		int fd;
-
-		/* Already connected */
-		if (dgram->t.sock.fd != -1)
-			return 0;
-
-		/* Create an UDP socket and connect it on the nameserver's IP/Port */
-		if ((fd = socket(ns->dgram->addr.to.ss_family, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
-			send_log(NULL, LOG_WARNING,
-				 "DNS : resolvers '%s': can't create socket for nameserver '%s'.\n",
-				 ns->counters->pid, ns->id);
-			return -1;
-		}
-		if (connect(fd, (struct sockaddr*)&ns->dgram->addr.to, get_addr_len(&ns->dgram->addr.to)) == -1) {
-			send_log(NULL, LOG_WARNING,
-				 "DNS : resolvers '%s': can't connect socket for nameserver '%s'.\n",
-				 ns->counters->id, ns->id);
-			close(fd);
-			return -1;
-		}
-
-		/* Make the socket non blocking */
-		fcntl(fd, F_SETFL, O_NONBLOCK);
-
-		/* Add the fd in the fd list and update its parameters */
-		dgram->t.sock.fd = fd;
-		fd_insert(fd, dgram, dgram_fd_handler, MAX_THREADS_MASK);
-		fd_want_recv(fd);
-	}
-	return 0;
-}
-
 /* Forges a DNS query. It needs the following information from the caller:
  *  - <query_id>        : the DNS query id corresponding to this query
  *  - <query_type>      : DNS_RTYPE_* request DNS record type (A, AAAA, ANY...)
@@ -352,38 +313,6 @@ static int resolv_build_query(int query_id, int query_type, unsigned int accepte
 	p += sizeof(edns);
 
 	return (p - buf);
-}
-
-/* Sends a message to a name server
- * It returns message length on success
- * or -1 in error case
- * 0 is returned in case of EAGAIN 
- */
-int dns_send_nameserver(struct dns_nameserver *ns, void *buf, size_t len)
-{
-	int ret;
-
-	if (ns->dgram) {
-		int fd = ns->dgram->t.sock.fd;
-
-		if (fd == -1) {
-			if (dns_connect_nameserver(ns) == -1)
-				return -1;
-			fd = ns->dgram->t.sock.fd;
-		}
-
-		ret = send(fd, buf, len, 0);
-		if (ret < 0) {
-			if (errno == EAGAIN)
-				return 0;
-			
-			fd_delete(fd);
-			close(fd);
-			ns->dgram->t.sock.fd = -1;
-		}
-	}
-
-	return ret;
 }
 
 /* Sends a DNS query to resolvers associated to a resolution. It returns 0 on
@@ -755,34 +684,6 @@ static void resolv_check_response(struct resolv_resolution *res)
 			}
 		}
 	}
-}
-
-/* Receives a dns message
- * Returns message length
- * 0 is returned if no more message available
- * -1 in error case
- */
-ssize_t dns_recv_nameserver(struct dns_nameserver *ns, void *data, size_t size)
-{
-        ssize_t ret = -1;
-
-	if (ns->dgram) {
-		int fd = ns->dgram->t.sock.fd;
-
-		if (fd == -1)
-			return -1;
-
-		if ((ret = recv(fd, data, size, 0)) < 0) {
-			if (errno == EAGAIN)
-				return 0;
-			fd_delete(fd);
-			close(fd);
-			ns->dgram->t.sock.fd = -1;
-			return -1;
-		}
-	}
-
-	return ret;
 }
 
 /* Validates that the buffer DNS response provided in <resp> and finishing
@@ -1907,43 +1808,6 @@ void resolv_unlink_resolution(struct resolv_requester *requester)
 	}
 }
 
-static void dns_resolve_recv(struct dgram_conn *dgram)
-{
-	struct dns_nameserver *ns;
-	struct resolvers  *resolvers;
-	struct resolv_resolution *res;
-	struct resolv_query_item *query;
-	unsigned char  buf[DNS_MAX_UDP_MESSAGE + 1];
-	unsigned char *bufend;
-	int fd, buflen, dns_resp;
-	int max_answer_records;
-	unsigned short query_id;
-	struct eb32_node *eb;
-	struct resolv_requester *req;
-
-	fd = dgram->t.sock.fd;
-
-	/* check if ready for reading */
-	if (!fd_recv_ready(fd))
-		return;
-
-	/* no need to go further if we can't retrieve the nameserver */
-	if ((ns = dgram->owner) == NULL) {
-		_HA_ATOMIC_AND(&fdtab[fd].ev, ~(FD_POLL_HUP|FD_POLL_ERR));
-		fd_stop_recv(fd);
-		return;
-	}
-
-	if (ns->process_responses(ns) <= 0) {
-		/* FIXME : for now we consider EAGAIN only, but at
-		 * least we purge sticky errors that would cause us to
-		 * be called in loops.
-		 */
-		_HA_ATOMIC_AND(&fdtab[fd].ev, ~(FD_POLL_HUP|FD_POLL_ERR));
-		fd_cant_recv(fd);
-	}
-}
-
 /* Called when a network IO is generated on a name server socket for an incoming
  * packet. It performs the following actions:
  *  - check if the packet requires processing (not outdated resolution)
@@ -2131,21 +1995,6 @@ static int resolv_process_responses(struct dns_nameserver *ns)
 
 	return buflen;
 }
-/* Called when a dns network socket is ready to send data */
-static void dns_resolve_send(struct dgram_conn *dgram)
-{
-	int fd;
-
-	fd = dgram->t.sock.fd;
-
-	/* check if ready for sending */
-	if (!fd_send_ready(fd))
-		return;
-
-	/* we don't want/need to be waked up any more for sending */
-	fd_stop_send(fd);
-
-}
 
 /* Processes DNS resolution. First, it checks the active list to detect expired
  * resolutions and retry them if possible. Else a timeout is reported. Then, it
@@ -2224,12 +2073,6 @@ static struct task *process_resolvers(struct task *t, void *context, unsigned sh
 	HA_SPIN_UNLOCK(DNS_LOCK, &resolvers->lock);
 	return t;
 }
-
-/* proto_udp callback functions for a DNS resolution */
-struct dgram_data_cb dns_dgram_cb = {
-	.recv = dns_resolve_recv,
-	.send = dns_resolve_send,
-};
 
 /* Release memory allocated by DNS */
 static void resolvers_deinit(void)
@@ -3332,24 +3175,6 @@ resolv_out:
  out:
 	free(errmsg);
 	return err_code;
-}
-
-int dns_dgram_init(struct dns_nameserver *ns, struct sockaddr_storage *sk)
-{
-	struct dgram_conn *dgram;
-
-	 if ((dgram = calloc(1, sizeof(*dgram))) == NULL)
-		return -1;
-
-	/* Leave dgram partially initialized, no FD attached for
-	 * now. */
-	dgram->owner     = ns;
-	dgram->data      = &dns_dgram_cb;
-	dgram->t.sock.fd = -1;
-	dgram->addr.to = *sk;
-	ns->dgram = dgram;
-
-	return 0;
 }
 
 REGISTER_CONFIG_SECTION("resolvers",      cfg_parse_resolvers, NULL);
