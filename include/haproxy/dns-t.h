@@ -96,7 +96,10 @@ struct dns_session {
 	size_t ofs;            // ring buffer reader offset
 	struct appctx *appctx; // appctx of current session
 	struct dns_stream_server *dss;
-	int tx_msg_offset;
+	uint16_t tx_msg_offset;
+	uint16_t rx_msg_offset;
+	uint16_t rx_msg_len;
+	unsigned char *rx_msg_buf;
 	int used_slots;
 	int queued_slots;
 	int query_counter;

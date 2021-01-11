@@ -481,39 +481,33 @@ static void dns_session_io_handler(struct appctx *appctx)
 		si_rx_endp_done(si);
 	}
 
-	while (si_oc(si)->output) {
+	while (1) {
 		uint16_t query_id;
 		struct eb32_node *eb;
 		struct dns_query *query;
+		int getblock;
 
-		if (co_getblk(si_oc(si), (char *)&msg_len, 2, 0) <= 0) {
-			goto incomplete;
-		}
-
-		msg_len = ntohs(msg_len);
-		if (co_getblk(si_oc(si), tmp_dns_buf, msg_len, 2) <= 0) {
-			goto incomplete;
-		}
-
-		memcpy(&query_id, tmp_dns_buf, 2);
-
-
-		eb = eb32_lookup(&ds->query_ids, query_id);
-		if (eb) {
+		if (ds->rx_msg_len && ds->rx_msg_len == ds->rx_msg_offset) {
 			struct ist myist;
-			query = eb32_entry(eb, struct dns_query, qid);
 
-			memcpy(tmp_dns_buf, &query->original_qid, 2);
-			eb32_delete(&query->qid);
+			myist.ptr = ds->rx_msg_buf;
+			myist.len = ds->rx_msg_len;
+			if (ring_write(ds->dss->ring_rsp, 65535, NULL, 0, &myist, 1) <= 0) {
+				/* no enough room into rx ring, we retry later */
+				break;
+			}
+			ds->rx_msg_len = ds->rx_msg_offset = 0;
+
 			/* we need to lock dss, but we dont want
 			 * dead lock so we firstly release
 			 * dns_session lock */
 			HA_SPIN_UNLOCK(SFT_LOCK, &ds->lock);
 
 			/* we lock both dss and session lock */
-
 			HA_SPIN_LOCK(SFT_LOCK, &ds->dss->lock);
 			HA_SPIN_LOCK(SFT_LOCK, &ds->lock);
+
+			/* update used slots */
 			ds->used_slots--;
 			LIST_DEL(&ds->list);
 			if (ds->used_slots)
@@ -521,18 +515,48 @@ static void dns_session_io_handler(struct appctx *appctx)
 			else
 				LIST_ADDQ(&ds->dss->sessions, &ds->list);
 
-			myist.ptr = tmp_dns_buf;
-			myist.len = msg_len;
-			ring_write(ds->dss->ring_rsp, 65535, NULL, 0, &myist, 1);
+			/* awake task handling the response */
 			task_wakeup(ds->dss->task_rsp, TASK_WOKEN_INIT);
-			/* we can release dss but we keep lock on session
-			 * until the end */
-			HA_SPIN_UNLOCK(SFT_LOCK, &ds->dss->lock);
 
+			/* we can release dss but we keep lock on session
+		 	 * until the end */
+			HA_SPIN_UNLOCK(SFT_LOCK, &ds->dss->lock);
 		}
 
-		/* always drain data from server */
-		co_skip(si_oc(si), 2 + msg_len);
+		if (co_data(si_oc(si)) < 2)
+			break;
+
+		co_getblk(si_oc(si), (char *)&msg_len, 2, 0);
+
+		co_skip(si_oc(si), 2);
+
+		ds->rx_msg_len = ntohs(msg_len);
+
+		if (co_data(si_oc(si)) + ds->rx_msg_offset < ds->rx_msg_len) {
+			/* message only partially available */
+			co_getblk(si_oc(si), ds->rx_msg_buf + ds->rx_msg_offset, co_data(si_oc(si)), 0);
+			ds->rx_msg_offset += co_data(si_oc(si));
+			co_skip(si_oc(si), co_data(si_oc(si)));
+			break;
+		}
+		else {
+			/* message will be fully available */
+			co_getblk(si_oc(si), ds->rx_msg_buf + ds->rx_msg_offset, ds->rx_msg_len - ds->rx_msg_offset, 0);
+			ds->rx_msg_offset = ds->rx_msg_len;
+			co_skip(si_oc(si), ds->rx_msg_len - ds->rx_msg_offset);
+
+			/* remap query id to original */
+			memcpy(&query_id, ds->rx_msg_buf, 2);
+			eb = eb32_lookup(&ds->query_ids, query_id);
+			if (!eb) {
+				/* reset len and offset to mark message as consumed */
+				ds->rx_msg_len = ds->rx_msg_offset = 0;
+				continue;
+			}
+			query = eb32_entry(eb, struct dns_query, qid);
+			eb32_delete(&query->qid);
+			memcpy(ds->rx_msg_buf, &query->original_qid, 2);
+		}	
 	}
 incomplete:
 	HA_SPIN_UNLOCK(SFT_LOCK, &ds->lock);
@@ -692,6 +716,7 @@ static struct task *dns_process_req(struct task *t, void *context, unsigned shor
 		if (LIST_ISEMPTY(&dss->sessions)) {
 			ds = calloc(1, sizeof (*ds));
 			ds->ring = ring_new(65535);
+			ds->rx_msg_buf = malloc(65535);
 			ds->ofs = ~0;
 			ds->dss = dss;
 			LIST_INIT(&ds->list);
