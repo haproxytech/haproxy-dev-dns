@@ -300,6 +300,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 	struct ring *ring = ds->ring;
 	struct buffer *buf = &ring->buf;
 	uint64_t msg_len;
+	int available_room;
 	size_t len, cnt, ofs;
 	int ret = 0;
 
@@ -386,33 +387,83 @@ static void dns_session_io_handler(struct appctx *appctx)
 			cnt += len;
 			BUG_ON(msg_len + ofs + cnt + 1 > b_data(buf));
 
-			if (unlikely(2 + msg_len > b_size(&trash))) {
-				/* too large a message to ever fit, let's skip it */
-				ofs += cnt + msg_len;
-				continue;
+			/* retrieve available room on output channel */
+			available_room = channel_recv_max(si_ic(si));
+
+			/* tx_msg_offset null means we are at the start of a new message */
+			if (!ds->tx_msg_offset) {
+				uint16_t slen;
+
+				/* check if there is enough room to put message len and query id */
+				if (available_room < sizeof(slen) + sizeof(new_qid)) {
+					si_rx_room_blk(si);
+					ret = 0;
+					break;
+				}
+
+				/* put msg len into then channel */
+				slen = (uint16_t)msg_len;
+				slen = htons(slen);
+				ci_putblk(si_ic(si), (char *)&slen, sizeof(slen));
+				available_room -= sizeof(slen);
+
+				/* backup original query id */
+				len = b_getblk(buf, (char *)&original_qid, sizeof(original_qid), ofs + cnt);
+				/* generates new query id */
+				new_qid = ++ds->query_counter;
+				new_qid = htons(new_qid);
+
+				/* put new query id into the channel */
+				ci_putblk(si_ic(si), (char *)&new_qid, sizeof(new_qid));
+				available_room -= sizeof(new_qid);
+
+				/* keep query id mapping */
+				query = calloc(1, sizeof(struct dns_query));
+				query->qid.key = new_qid;
+				query->original_qid = original_qid;
+				eb32_insert(&ds->query_ids, &query->qid);
+
+				/* update the tx_offset to handle output in 16k streams */
+				ds->tx_msg_offset = sizeof(original_qid);
+
 			}
 
-			chunk_reset(&trash);
-			trash.area[0] = (msg_len >> 8) & 0xff;
-			trash.area[1] = msg_len & 0xff;
-			trash.data += 2;
-			len = b_getblk(buf, trash.area + 2, msg_len, ofs + cnt);
-			trash.data += len;
-			memcpy(&original_qid, trash.area + 2, 2);
-			new_qid = ++ds->query_counter;
-			new_qid = htons(new_qid);
-			memcpy(trash.area + 2, &new_qid, 2);
-
-			if (ci_putchk(si_ic(si), &trash) == -1) {
+			/* check if it remains available room on output chan */
+			if (unlikely(!available_room)) {
 				si_rx_room_blk(si);
 				ret = 0;
 				break;
 			}
-			query = calloc(1, sizeof(struct dns_query));
-			query->qid.key = new_qid;
-			query->original_qid = original_qid;
-			eb32_insert(&ds->query_ids, &query->qid);
-			ds->queued_slots--;
+
+			chunk_reset(&trash);
+			if ((msg_len - ds->tx_msg_offset) > available_room) {
+				/* remaining msg data is too large to be written in output channel at one time */
+
+				len = b_getblk(buf, trash.area, available_room, ofs + cnt + ds->tx_msg_offset);
+
+				/* update offset to complete mesg forwarding later */
+				ds->tx_msg_offset += len;
+			}
+			else {
+				/* remaining msg data can be written in output channel at one time */
+				len = b_getblk(buf, trash.area, msg_len - ds->tx_msg_offset, ofs + cnt + ds->tx_msg_offset);
+
+				/* reset tx_msg_offset to mark forward fully processed */
+				ds->tx_msg_offset = 0;
+			}
+			trash.data += len;
+
+			ci_putchk(si_ic(si), &trash);
+
+			if (ds->tx_msg_offset) {
+				/* msg was not fully processed, we must aware to drain pending data */
+
+				si_rx_room_blk(si);
+				ret = 0;
+				break;
+			}
+
+			/* switch to next message */
 			ofs += cnt + msg_len;
 		}
 
