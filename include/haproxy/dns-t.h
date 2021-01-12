@@ -81,8 +81,9 @@ struct dns_stream_server {
 	size_t ofs_rsp;           // ring buffer reader offset
 	struct task *task_req;    /* req conn management */
 	struct task *task_rsp;    /* rsp management */
-	struct list sessions;
-	struct list full;
+	struct list actv_sess;
+	struct list full_sess;
+	struct list rlse_sess;
 	__decl_thread(HA_SPINLOCK_T lock); // lock to protect current struct
 };
 

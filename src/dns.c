@@ -334,9 +334,9 @@ static void dns_session_io_handler(struct appctx *appctx)
 		return;
 	}
 
-	HA_SPIN_LOCK(SFT_LOCK, &ds->lock);
+	HA_SPIN_LOCK(DNS_LOCK, &ds->lock);
 	if (appctx != ds->appctx) {
-		HA_SPIN_UNLOCK(SFT_LOCK, &ds->lock);
+		HA_SPIN_UNLOCK(DNS_LOCK, &ds->lock);
 		goto close;
 	}
 	ofs = ds->ofs;
@@ -462,7 +462,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 				ret = 0;
 				break;
 			}
-
+			ds->queued_slots--;
 			/* switch to next message */
 			ofs += cnt + msg_len;
 		}
@@ -501,26 +501,26 @@ static void dns_session_io_handler(struct appctx *appctx)
 			/* we need to lock dss, but we dont want
 			 * dead lock so we firstly release
 			 * dns_session lock */
-			HA_SPIN_UNLOCK(SFT_LOCK, &ds->lock);
+			HA_SPIN_UNLOCK(DNS_LOCK, &ds->lock);
 
 			/* we lock both dss and session lock */
-			HA_SPIN_LOCK(SFT_LOCK, &ds->dss->lock);
-			HA_SPIN_LOCK(SFT_LOCK, &ds->lock);
+			HA_SPIN_LOCK(DNS_LOCK, &ds->dss->lock);
+			HA_SPIN_LOCK(DNS_LOCK, &ds->lock);
 
 			/* update used slots */
 			ds->used_slots--;
 			LIST_DEL(&ds->list);
 			if (ds->used_slots)
-				LIST_ADD(&ds->dss->sessions, &ds->list);
+				LIST_ADD(&ds->dss->actv_sess, &ds->list);
 			else
-				LIST_ADDQ(&ds->dss->sessions, &ds->list);
+				LIST_ADDQ(&ds->dss->actv_sess, &ds->list);
 
 			/* awake task handling the response */
 			task_wakeup(ds->dss->task_rsp, TASK_WOKEN_INIT);
 
 			/* we can release dss but we keep lock on session
 		 	 * until the end */
-			HA_SPIN_UNLOCK(SFT_LOCK, &ds->dss->lock);
+			HA_SPIN_UNLOCK(DNS_LOCK, &ds->dss->lock);
 		}
 
 		if (co_data(si_oc(si)) < 2)
@@ -559,7 +559,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 		}	
 	}
 incomplete:
-	HA_SPIN_UNLOCK(SFT_LOCK, &ds->lock);
+	HA_SPIN_UNLOCK(DNS_LOCK, &ds->lock);
 	return;
 close:
 	si_shutw(si);
@@ -573,21 +573,27 @@ close:
  */
 static void dns_session_release(struct appctx *appctx)
 {
-	struct dns_session *ds = appctx->ctx.peers.ptr;
+	struct dns_session *ds = appctx->ctx.sft.ptr;
 
 	if (!ds)
 		return;
 
+	HA_SPIN_LOCK(DNS_LOCK, &ds->dss->lock);
 	HA_SPIN_LOCK(DNS_LOCK, &ds->lock);
 	if (ds->appctx == appctx) {
+		/* We do not call ring_appctx_detach here
+		 * because we want to keep readers couters
+		 * to retry a con with a different appctx*/
 		HA_RWLOCK_WRLOCK(DNS_LOCK, &ds->ring->lock);
-		LIST_DEL_INIT(&ds->appctx->wait_entry);
+		LIST_DEL_INIT(&appctx->wait_entry);
 		HA_RWLOCK_WRUNLOCK(DNS_LOCK, &ds->ring->lock);
-
 		ds->appctx = NULL;
+		LIST_DEL(&ds->list);
+		LIST_ADD(&ds->dss->rlse_sess, &ds->list);
 		task_wakeup(ds->dss->task_req, TASK_WOKEN_MSG);
 	}
 	HA_SPIN_UNLOCK(DNS_LOCK, &ds->lock);
+	HA_SPIN_UNLOCK(DNS_LOCK, &ds->dss->lock);
 }
 
 /* DNS tcp session applet */
@@ -670,10 +676,40 @@ static struct task *dns_process_req(struct task *t, void *context, unsigned shor
 	struct buffer *buf = &ring->buf;
 	uint64_t msg_len;
 	size_t len, cnt, ofs;
-	struct dns_session *ds;
-
+	struct dns_session *ds, *ads;
 	HA_SPIN_LOCK(DNS_LOCK, &dss->lock);
 
+	list_for_each_entry_safe(ds, ads, &dss->rlse_sess, list) {
+		LIST_DEL(&ds->list);
+		HA_SPIN_LOCK(DNS_LOCK, &ds->lock);
+		if (ds->queued_slots) {
+			/* there is pending queued messages
+			 * We try a re-connect
+			 */
+			ds->tx_msg_offset = 0;
+			ds->rx_msg_offset = 0;
+			ds->rx_msg_len = 0;
+			/* here the ofs and the attached counter
+			 * are keep unchanged
+			*/
+			ds->appctx = dns_session_create(ds);
+			ds->used_slots = ds->queued_slots;
+			if (ds->used_slots >= DNS_STREAM_MAX_SLOTS)
+				LIST_ADD(&dss->full_sess, &ds->list);
+			else
+				LIST_ADD(&dss->actv_sess, &ds->list);
+			HA_SPIN_UNLOCK(DNS_LOCK, &ds->lock);
+			continue;
+		}
+		/* session has no pending messages, it may be an idle
+		 * timeout session
+		 */
+		free(ds->rx_msg_buf);
+		ring_free(ds->ring);
+		HA_SPIN_UNLOCK(DNS_LOCK, &ds->lock);
+		free(ds);
+
+	}
 	ofs = dss->ofs_req;
 
 	HA_RWLOCK_RDLOCK(DNS_LOCK, &ring->lock);
@@ -700,6 +736,8 @@ static struct task *dns_process_req(struct task *t, void *context, unsigned shor
 	HA_ATOMIC_SUB(b_peek(buf, ofs), 1);
 
 	while (ofs + 1 < b_data(buf)) {
+		struct ist myist;
+
 		cnt = 1;
 		len = b_peek_varint(buf, ofs + cnt, &msg_len);
 		if (!len)
@@ -713,37 +751,48 @@ static struct task *dns_process_req(struct task *t, void *context, unsigned shor
 		}
 
 		len = b_getblk(buf, tmp_dns_buf, msg_len, ofs + cnt);
-		if (LIST_ISEMPTY(&dss->sessions)) {
-			ds = calloc(1, sizeof (*ds));
-			ds->ring = ring_new(65535);
-			ds->rx_msg_buf = malloc(65535);
-			ds->ofs = ~0;
-			ds->dss = dss;
-			LIST_INIT(&ds->list);
-			HA_SPIN_INIT(&ds->lock);
-			ds->appctx = dns_session_create(ds);
-			ring_attach(ds->ring);
-			HA_SPIN_LOCK(DNS_LOCK, &ds->lock);
-		}
-		else {
-			ds = LIST_NEXT(&dss->sessions, struct dns_session *, list);
-			HA_SPIN_LOCK(DNS_LOCK, &ds->lock);
-			LIST_DEL(&ds->list);
+
+		myist.ptr = tmp_dns_buf;
+		myist.len = len;
+
+		ads = NULL;
+		list_for_each_entry(ds, &dss->actv_sess, list) {
+			if (ring_write(ds->ring, 65535, NULL, 0, &myist, 1) > 0) {
+				HA_SPIN_LOCK(DNS_LOCK, &ds->lock);
+				ds->used_slots++;
+				ds->queued_slots++;
+				LIST_DEL(&ds->list);
+				if (ds->used_slots >= DNS_STREAM_MAX_SLOTS)
+					LIST_ADD(&dss->full_sess, &ds->list);
+				else
+					LIST_ADD(&dss->actv_sess, &ds->list);
+				HA_SPIN_UNLOCK(DNS_LOCK, &ds->lock);
+				ads = ds;
+				break;
+			}
 		}
 
-		{
-			struct ist myist;
-			myist.ptr = tmp_dns_buf;
-			myist.len = len;
-			ring_write(ds->ring, 65535, NULL, 0, &myist, 1);
-			ds->used_slots++;
-			ds->queued_slots++;
-			if (ds->used_slots >= DNS_STREAM_MAX_SLOTS)
-				LIST_ADD(&dss->full, &ds->list);
-			else
-				LIST_ADD(&dss->sessions, &ds->list);
+		/* we didn't find a session avalaible with large enough room */
+		if (!ads) {
+			/* allocate a new session */
+			ads = calloc(1, sizeof (*ads));
+			ads->ring = ring_new(65535);
+			ads->rx_msg_buf = malloc(65535);
+			ads->ofs = ~0;
+			ads->dss = dss;
+			LIST_INIT(&ads->list);
+			HA_SPIN_INIT(&ads->lock);
+
+			HA_SPIN_LOCK(DNS_LOCK, &ads->lock);
+			ads->appctx = dns_session_create(ads);
+			ring_attach(ads->ring);
+			/* ring is empty so this ring_write should never fail */
+			ring_write(ads->ring, 65535, NULL, 0, &myist, 1);
+			ads->used_slots++;
+			ads->queued_slots++;
+			LIST_ADD(&dss->actv_sess, &ads->list);
+			HA_SPIN_UNLOCK(DNS_LOCK, &ads->lock);
 		}
-		HA_SPIN_UNLOCK(DNS_LOCK, &ds->lock);
 		ofs += cnt + len;
 	}
 
@@ -837,8 +886,9 @@ int dns_stream_init(struct dns_nameserver *ns, struct server *srv)
 		goto out;
 	}
 
-	LIST_INIT(&dss->sessions);
-	LIST_INIT(&dss->full);
+	LIST_INIT(&dss->rlse_sess);
+	LIST_INIT(&dss->actv_sess);
+	LIST_INIT(&dss->full_sess);
 	HA_SPIN_INIT(&dss->lock);
 	ns->stream = dss;
 	return 0;

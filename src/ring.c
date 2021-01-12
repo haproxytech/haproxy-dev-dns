@@ -109,14 +109,45 @@ void ring_free(struct ring *ring)
 	free(ring);
 }
 
-/* Tries to send <npfx> parts from <prefix> followed by <nmsg> parts from <msg>
- * to ring <ring>. The message is sent atomically. It may be truncated to
- * <maxlen> bytes if <maxlen> is non-null. There is no distinction between the
- * two lists, it's just a convenience to help the caller prepend some prefixes
- * when necessary. It takes the ring's write lock to make sure no other thread
- * will touch the buffer during the update. Returns the number of bytes sent,
- * or <=0 on failure.
- */
+ssize_t ring_free_room(struct ring *ring, size_t totlen)
+{
+	struct buffer *buf = &ring->buf;
+	size_t lenlen;
+	uint64_t dellen;
+	int dellenlen;
+	ssize_t sent = 0;
+	int ret = 0;
+
+	lenlen = varint_bytes(totlen);
+
+	HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &ring->lock);
+	if (lenlen + totlen + 1 + 1 > b_size(buf))
+		goto done_buf;
+
+	while (b_room(buf) < lenlen + totlen + 1) {
+		/* we need to delete the oldest message (from the end),
+		 * and we have to stop if there's a reader stuck there.
+		 * Unless there's corruption in the buffer it's guaranteed
+		 * that we have enough data to find 1 counter byte, a
+		 * varint-encoded length (1 byte min) and the message
+		 * payload (0 bytes min).
+		 */
+		if (*b_head(buf))
+			goto done_buf;
+		dellenlen = b_peek_varint(buf, 1, &dellen);
+		if (!dellenlen)
+			goto done_buf;
+		BUG_ON(b_data(buf) < 1 + dellenlen + dellen);
+
+		b_del(buf, 1 + dellenlen + dellen);
+		ring->ofs += 1 + dellenlen + dellen;
+	}
+	ret = 1;
+
+ done_buf:
+	HA_RWLOCK_WRUNLOCK(LOGSRV_LOCK, &ring->lock);
+	return ret;
+}
 ssize_t ring_write(struct ring *ring, size_t maxlen, const struct ist pfx[], size_t npfx, const struct ist msg[], size_t nmsg)
 {
 	struct buffer *buf = &ring->buf;
