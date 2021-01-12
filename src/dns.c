@@ -34,7 +34,10 @@
 #include <haproxy/stream.h>
 #include <haproxy/stream_interface.h>
 
-static THREAD_LOCAL char tmp_dns_buf[65535];
+static THREAD_LOCAL char tmp_dns_buf[DNS_TCP_MSG_MAX_SIZE];
+
+DECLARE_STATIC_POOL(dns_session_pool, "dns_session", sizeof(struct dns_session));
+DECLARE_STATIC_POOL(dns_query_pool, "dns_query", sizeof(struct dns_query));
 
 /* Opens an UDP socket on the namesaver's IP/Port, if required. Returns 0 on
  * success, -1 otherwise.
@@ -108,7 +111,7 @@ int dns_send_nameserver(struct dns_nameserver *ns, void *buf, size_t len)
 
 		myist.ptr = buf;
 		myist.len = len;
-                ret = ring_write(ns->stream->ring_req, 65535, NULL, 0, &myist, 1);
+                ret = ring_write(ns->stream->ring_req, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1);
 		if (ret) {
 			task_wakeup(ns->stream->task_req, TASK_WOKEN_MSG);
 			return ret;
@@ -297,7 +300,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 {
 	struct stream_interface *si = appctx->owner;
 	struct dns_session *ds = appctx->ctx.sft.ptr;
-	struct ring *ring = ds->ring;
+	struct ring *ring = &ds->ring;
 	struct buffer *buf = &ring->buf;
 	uint64_t msg_len;
 	int available_room;
@@ -418,10 +421,12 @@ static void dns_session_io_handler(struct appctx *appctx)
 				available_room -= sizeof(new_qid);
 
 				/* keep query id mapping */
-				query = calloc(1, sizeof(struct dns_query));
-				query->qid.key = new_qid;
-				query->original_qid = original_qid;
-				eb32_insert(&ds->query_ids, &query->qid);
+				query = pool_alloc(dns_query_pool);
+				if (query) {
+					query->qid.key = new_qid;
+					query->original_qid = original_qid;
+					eb32_insert(&ds->query_ids, &query->qid);
+				}
 
 				/* update the tx_offset to handle output in 16k streams */
 				ds->tx_msg_offset = sizeof(original_qid);
@@ -487,16 +492,16 @@ static void dns_session_io_handler(struct appctx *appctx)
 		struct dns_query *query;
 		int getblock;
 
-		if (ds->rx_msg_len && ds->rx_msg_len == ds->rx_msg_offset) {
+		if (ds->rx_msg.len && ds->rx_msg.len == ds->rx_msg.offset) {
 			struct ist myist;
 
-			myist.ptr = ds->rx_msg_buf;
-			myist.len = ds->rx_msg_len;
-			if (ring_write(ds->dss->ring_rsp, 65535, NULL, 0, &myist, 1) <= 0) {
+			myist.ptr = ds->rx_msg.buf;
+			myist.len = ds->rx_msg.len;
+			if (ring_write(ds->dss->ring_rsp, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1) <= 0) {
 				/* no enough room into rx ring, we retry later */
 				break;
 			}
-			ds->rx_msg_len = ds->rx_msg_offset = 0;
+			ds->rx_msg.len = ds->rx_msg.offset = 0;
 
 			/* we need to lock dss, but we dont want
 			 * dead lock so we firstly release
@@ -530,32 +535,33 @@ static void dns_session_io_handler(struct appctx *appctx)
 
 		co_skip(si_oc(si), 2);
 
-		ds->rx_msg_len = ntohs(msg_len);
+		ds->rx_msg.len = ntohs(msg_len);
 
-		if (co_data(si_oc(si)) + ds->rx_msg_offset < ds->rx_msg_len) {
+		if (co_data(si_oc(si)) + ds->rx_msg.offset < ds->rx_msg.len) {
 			/* message only partially available */
-			co_getblk(si_oc(si), ds->rx_msg_buf + ds->rx_msg_offset, co_data(si_oc(si)), 0);
-			ds->rx_msg_offset += co_data(si_oc(si));
+			co_getblk(si_oc(si), ds->rx_msg.buf + ds->rx_msg.offset, co_data(si_oc(si)), 0);
+			ds->rx_msg.offset += co_data(si_oc(si));
 			co_skip(si_oc(si), co_data(si_oc(si)));
 			break;
 		}
 		else {
 			/* message will be fully available */
-			co_getblk(si_oc(si), ds->rx_msg_buf + ds->rx_msg_offset, ds->rx_msg_len - ds->rx_msg_offset, 0);
-			ds->rx_msg_offset = ds->rx_msg_len;
-			co_skip(si_oc(si), ds->rx_msg_len - ds->rx_msg_offset);
+			co_getblk(si_oc(si), ds->rx_msg.buf + ds->rx_msg.offset, ds->rx_msg.len - ds->rx_msg.offset, 0);
+			ds->rx_msg.offset = ds->rx_msg.len;
+			co_skip(si_oc(si), ds->rx_msg.len - ds->rx_msg.offset);
 
 			/* remap query id to original */
-			memcpy(&query_id, ds->rx_msg_buf, 2);
+			memcpy(&query_id, ds->rx_msg.buf, sizeof(query_id));
 			eb = eb32_lookup(&ds->query_ids, query_id);
 			if (!eb) {
 				/* reset len and offset to mark message as consumed */
-				ds->rx_msg_len = ds->rx_msg_offset = 0;
+				ds->rx_msg.len = ds->rx_msg.offset = 0;
 				continue;
 			}
 			query = eb32_entry(eb, struct dns_query, qid);
 			eb32_delete(&query->qid);
-			memcpy(ds->rx_msg_buf, &query->original_qid, 2);
+			memcpy(ds->rx_msg.buf, &query->original_qid, sizeof(query->original_qid));
+			pool_free(dns_query_pool, query);
 		}	
 	}
 incomplete:
@@ -584,9 +590,9 @@ static void dns_session_release(struct appctx *appctx)
 		/* We do not call ring_appctx_detach here
 		 * because we want to keep readers couters
 		 * to retry a con with a different appctx*/
-		HA_RWLOCK_WRLOCK(DNS_LOCK, &ds->ring->lock);
+		HA_RWLOCK_WRLOCK(DNS_LOCK, &ds->ring.lock);
 		LIST_DEL_INIT(&appctx->wait_entry);
-		HA_RWLOCK_WRUNLOCK(DNS_LOCK, &ds->ring->lock);
+		HA_RWLOCK_WRUNLOCK(DNS_LOCK, &ds->ring.lock);
 		ds->appctx = NULL;
 		LIST_DEL(&ds->list);
 		LIST_ADD(&ds->dss->rlse_sess, &ds->list);
@@ -686,9 +692,7 @@ static struct task *dns_process_req(struct task *t, void *context, unsigned shor
 			/* there is pending queued messages
 			 * We try a re-connect
 			 */
-			ds->tx_msg_offset = 0;
-			ds->rx_msg_offset = 0;
-			ds->rx_msg_len = 0;
+			ds->rx_msg.offset = ds->rx_msg.len = 0;
 			/* here the ofs and the attached counter
 			 * are keep unchanged
 			*/
@@ -704,10 +708,8 @@ static struct task *dns_process_req(struct task *t, void *context, unsigned shor
 		/* session has no pending messages, it may be an idle
 		 * timeout session
 		 */
-		free(ds->rx_msg_buf);
-		ring_free(ds->ring);
 		HA_SPIN_UNLOCK(DNS_LOCK, &ds->lock);
-		free(ds);
+		pool_free(dns_session_pool, ds);
 
 	}
 	ofs = dss->ofs_req;
@@ -757,7 +759,7 @@ static struct task *dns_process_req(struct task *t, void *context, unsigned shor
 
 		ads = NULL;
 		list_for_each_entry(ds, &dss->actv_sess, list) {
-			if (ring_write(ds->ring, 65535, NULL, 0, &myist, 1) > 0) {
+			if (ring_write(&ds->ring, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1) > 0) {
 				HA_SPIN_LOCK(DNS_LOCK, &ds->lock);
 				ds->used_slots++;
 				ds->queued_slots++;
@@ -775,24 +777,26 @@ static struct task *dns_process_req(struct task *t, void *context, unsigned shor
 		/* we didn't find a session avalaible with large enough room */
 		if (!ads) {
 			/* allocate a new session */
-			ads = calloc(1, sizeof (*ads));
-			ads->ring = ring_new(65535);
-			ads->rx_msg_buf = malloc(65535);
-			ads->ofs = ~0;
-			ads->dss = dss;
-			LIST_INIT(&ads->list);
-			HA_SPIN_INIT(&ads->lock);
-
-			HA_SPIN_LOCK(DNS_LOCK, &ads->lock);
-			ads->appctx = dns_session_create(ads);
-			ring_attach(ads->ring);
-			/* ring is empty so this ring_write should never fail */
-			ring_write(ads->ring, 65535, NULL, 0, &myist, 1);
-			ads->used_slots++;
-			ads->queued_slots++;
-			LIST_ADD(&dss->actv_sess, &ads->list);
-			HA_SPIN_UNLOCK(DNS_LOCK, &ads->lock);
+			ads = pool_alloc(dns_session_pool);
+			if (ads) {
+				ring_init(&ads->ring, ads->tx_ring_area, sizeof(ads->tx_ring_area));
+				ads->ofs = ~0;
+				ads->dss = dss;
+				ds->rx_msg.offset = ds->rx_msg.len = 0;
+				LIST_INIT(&ads->list);
+				HA_SPIN_INIT(&ads->lock);
+				HA_SPIN_LOCK(DNS_LOCK, &ads->lock);
+				ads->appctx = dns_session_create(ads);
+				ring_attach(&ads->ring);
+				/* ring is empty so this ring_write should never fail */
+				ring_write(&ads->ring, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1);
+				ads->used_slots++;
+				ads->queued_slots++;
+				LIST_ADD(&dss->actv_sess, &ads->list);
+				HA_SPIN_UNLOCK(DNS_LOCK, &ads->lock);
+			}
 		}
+
 		ofs += cnt + len;
 	}
 
@@ -835,7 +839,7 @@ int dns_stream_init(struct dns_nameserver *ns, struct server *srv)
 	dss->srv = srv;
 
 	dss->ofs_req = ~0; /* init ring offset */
-	dss->ring_req = ring_new(65535);
+	dss->ring_req = ring_new(1 + 1 + varint_bytes(DNS_TCP_MSG_MAX_SIZE) + DNS_TCP_MSG_MAX_SIZE);
 	if (!dss->ring_req) {
 		ha_alert("memory allocation error initializing the ring for dns tcp server '%s'.\n", srv->id);
 		         err_code |= ERR_ALERT | ERR_FATAL;
@@ -861,7 +865,7 @@ int dns_stream_init(struct dns_nameserver *ns, struct server *srv)
 	}
 
 	dss->ofs_rsp = ~0; /* init ring offset */
-	dss->ring_rsp = ring_new(65535);
+	dss->ring_rsp = ring_new(1 + 1 + varint_bytes(DNS_TCP_MSG_MAX_SIZE) + DNS_TCP_MSG_MAX_SIZE);
 	if (!dss->ring_rsp) {
 		ha_alert("memory allocation error initializing the ring for dns tcp server '%s'.\n", srv->id);
 		         err_code |= ERR_ALERT | ERR_FATAL;

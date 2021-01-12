@@ -25,8 +25,10 @@
 #include <import/eb32tree.h>
 
 #include <haproxy/connection-t.h>
+#include <haproxy/buf-t.h>
 #include <haproxy/dgram-t.h>
 #include <haproxy/obj_type-t.h>
+#include <haproxy/ring-t.h>
 #include <haproxy/stats-t.h>
 #include <haproxy/task-t.h>
 #include <haproxy/thread.h>
@@ -36,6 +38,8 @@
 
 /* max pending requests per stream */
 #define DNS_STREAM_MAX_SLOTS    4
+
+#define DNS_TCP_MSG_MAX_SIZE 65535
 
 /* DNS request or response header structure */
 struct dns_header {
@@ -93,20 +97,23 @@ struct dns_query {
 };
 
 struct dns_session {
-	struct ring *ring;
-	size_t ofs;            // ring buffer reader offset
 	struct appctx *appctx; // appctx of current session
 	struct dns_stream_server *dss;
 	uint16_t tx_msg_offset;
-	uint16_t rx_msg_offset;
-	uint16_t rx_msg_len;
-	unsigned char *rx_msg_buf;
 	int used_slots;
 	int queued_slots;
 	int query_counter;
 	struct list list;
 	struct eb_root query_ids; /* tree to quickly lookup/retrieve query ids currently in use */
 	__decl_thread(HA_SPINLOCK_T lock); // lock to protect current struct
+	size_t ofs;            // ring buffer reader offset
+	struct ring ring;
+	struct  {
+		uint16_t len;
+		uint16_t offset;
+		unsigned char buf[DNS_TCP_MSG_MAX_SIZE];
+	} rx_msg;
+	unsigned char tx_ring_area[1 + 1 + 3 + DNS_TCP_MSG_MAX_SIZE]; // varint_bytes(DNS_TCP_MSG_MAX_SIZE) == 3
 };
 
 struct dns_counters {
