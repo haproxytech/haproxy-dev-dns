@@ -35,6 +35,7 @@
 #include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
 #include <haproxy/resolvers.h>
+#include <haproxy/ring.h>
 #include <haproxy/sample.h>
 #include <haproxy/server.h>
 #include <haproxy/stats.h>
@@ -2087,9 +2088,24 @@ static void resolvers_deinit(void)
 		list_for_each_entry_safe(ns, nsback, &resolvers->nameservers, list) {
 			free(ns->id);
 			free((char *)ns->conf.file);
-			if (ns->dgram && ns->dgram->t.sock.fd != -1)
-				fd_delete(ns->dgram->t.sock.fd);
-			free(ns->dgram);
+			if (ns->dgram) {
+				if (ns->dgram->t.sock.fd != -1) {
+					fd_delete(ns->dgram->t.sock.fd);
+					close(ns->dgram->t.sock.fd);
+				}
+				free(ns->dgram);
+			}
+			if (ns->stream) {
+				if (ns->stream->ring_rsp)
+					ring_free(ns->stream->ring_rsp);
+				if (ns->stream->ring_req)
+					ring_free(ns->stream->ring_req);
+				if (ns->stream->task_req)
+					task_destroy(ns->stream->task_req);
+				if (ns->stream->task_rsp)
+					task_destroy(ns->stream->task_rsp);
+				free(ns->stream);
+			}
 			LIST_DEL(&ns->list);
 			EXTRA_COUNTERS_FREE(ns->extra_counters);
 			free(ns);
@@ -3211,7 +3227,77 @@ resolv_out:
 	free(errmsg);
 	return err_code;
 }
+int cfg_post_parse_resolvers()
+{
+	int err_code = 0;
+	struct server *srv;
+	struct task *t;
 
-REGISTER_CONFIG_SECTION("resolvers",      cfg_parse_resolvers, NULL);
+	if (curr_resolvers) {
+
+		/* prepare forward server descriptors */
+		if (curr_resolvers->px) {
+			srv = curr_resolvers->px->srv;
+			while (srv) {
+				struct dns_nameserver *ns;
+
+				list_for_each_entry(ns, &curr_resolvers->nameservers, list) {
+					/* Error if two resolvers owns the same name */
+					if (strcmp(ns->id, srv->id) == 0) {
+						ha_alert("Parsing [%s:%d]: nameserver '%s' has same name as another nameserver (declared at %s:%d).\n",
+							 srv->conf.file, srv->conf.line, srv->id, ns->conf.file, ns->conf.line);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						break;
+					}
+				}
+
+				/* init ssl if needed */
+				if (srv->use_ssl == 1 && xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->prepare_srv) {
+					if (xprt_get(XPRT_SSL)->prepare_srv(srv)) {
+						ha_alert("unable to prepare SSL for server '%s' in resolvers section '%s'.\n", srv->id, curr_resolvers->id);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						break;
+					}
+				}
+
+				/* allocate nameserver */
+				ns = calloc(1, sizeof(*ns));
+				if (!ns) {
+					ha_alert("memory allocation error initializing tcp server '%s' in resolvers section '%s'.\n", srv->id, curr_resolvers->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					break;
+				}
+
+				if (dns_stream_init(ns, srv) < 0) {
+					ha_alert("memory allocation error initializing tcp server '%s' in resolvers section '%s'.\n", srv->id, curr_resolvers->id);
+					err_code |= ERR_ALERT|ERR_ABORT;
+					break;
+				}
+
+				ns->conf.file = strdup(srv->conf.file);
+				if (!ns->conf.file) {
+					ha_alert("memory allocation error initializing tcp server '%s' in resolvers section '%s'.\n", srv->id, curr_resolvers->id);
+					err_code |= ERR_ALERT|ERR_ABORT;
+					break;
+				}
+				ns->id = strdup(srv->id);
+				if (!ns->id) {
+					ha_alert("memory allocation error initializing tcp server '%s' in resolvers section '%s'.\n", srv->id, curr_resolvers->id);
+					err_code |= ERR_ALERT|ERR_ABORT;
+					break;
+				}
+				ns->conf.line = srv->conf.line;
+				ns->process_responses = resolv_process_responses;
+				ns->parent = curr_resolvers;
+				LIST_ADDQ(&curr_resolvers->nameservers, &ns->list);
+				srv = srv->next;
+			}
+		}
+	}
+	curr_resolvers = NULL;
+	return err_code;
+}
+
+REGISTER_CONFIG_SECTION("resolvers",      cfg_parse_resolvers, cfg_post_parse_resolvers);
 REGISTER_POST_DEINIT(resolvers_deinit);
 REGISTER_CONFIG_POSTPARSER("dns runtime resolver", resolvers_finalize_config);
